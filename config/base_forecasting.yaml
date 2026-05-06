@@ -1,0 +1,59 @@
+# type: args
+
+train:
+  epochs: 50
+  batch_size: 8
+  lr: 1.0e-3
+  itr_per_epoch: 1.0e+8
+  valid_epoch_interval: 5
+  patience: 10
+  num_workers: 0
+  fast_val: true
+  val_max_batches: 10
+  val_num_samples: 1
+  val_diffusion_steps: 10
+  val_aggregate: "mean"
+  mixup: false
+
+diffusion:
+  layers: 4
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.5
+  num_steps: 50
+  schedule: "quad"
+  is_linear: true
+
+model:
+  is_unconditional: 0
+  timeemb: 128
+  featureemb: 16
+  target_strategy: "test"
+  num_sample_features: 64
+  task_name: "forecasting"
+  seq_len: 96
+  pred_len: 96
+  benchmark_mode: true
+  llm:
+    enabled: true
+    mode: "cache"
+    cache_dir: "./data/llm_embeddings"
+    cache_dtype: "float16"
+    model_name: "./pretrained_models/gpt2"
+    embedding_dim: 768
+    proj_dim: 32
+    target_only: true
+    layers: 3
+    prefix_tokens: 4
+    dropout: 0.1
+    use_backbone: true
+    local_files_only: true
+    strict_load: true
+    fallback_to_transformer: false
+    num_mask_variants: 1
+    missing_ratio_min: 0.05
+    missing_ratio_max: 0.5
+    require_cache: true
+    max_prompt_values: 48

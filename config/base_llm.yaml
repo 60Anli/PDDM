@@ -1,0 +1,41 @@
+# type: args
+
+train:
+  epochs: 200
+  batch_size: 16
+  lr: 1.0e-3
+  itr_per_epoch: 1.0e+8
+  mixup: false
+
+
+diffusion:
+  layers: 4
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.5
+  num_steps: 50
+  schedule: "quad"
+  is_linear: false
+
+model:
+  is_unconditional: 0
+  timeemb: 128
+  featureemb: 16
+  target_strategy: "random"
+  llm:
+    enabled: true
+    mode: "runtime"
+    model_name: "./pretrained_models/gpt2"
+    embedding_dim: 768
+    proj_dim: 64
+    prior_loss_weight: 0.1
+    layers: 3
+    prefix_tokens: 4
+    patch_len: 8
+    dropout: 0.1
+    use_backbone: true
+    local_files_only: true
+    strict_load: true
+    fallback_to_transformer: false

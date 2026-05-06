@@ -1,0 +1,6 @@
+这次我做的核心改造是：
+
+runtime_llm_conditioner.py 现在只输出粗插补先验 x_prior，不再输出给 diffusion 用的 llm_info。
+多时间步和层间diff_model对L升维.py 已彻底去掉 llm_info 注入、llm_gate、llm_projection 这条分支。
+多时间步和层间main_model.py 的训练、验证、采样入口都改成只走 x_prior + prior_loss + prior_residual_gate，不再构造或传递 llm_info。
+LLM_USAGE.md 也同步改成 prior-only 的描述

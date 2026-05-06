@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and temp
+*.log
+*.tmp
+
+# Experiment outputs
+save/
+
+# Local data and caches
+data/*
+!data/.gitkeep
+pretrained_models/
+
+# Model checkpoints and large artifacts
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.npy
+*.npz
+*.pkl
+*.pk
+
+# Notebook
+.ipynb_checkpoints/
