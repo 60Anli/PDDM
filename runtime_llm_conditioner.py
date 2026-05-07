@@ -39,8 +39,16 @@ class RuntimeLLMConditioner(nn.Module):
             nn.GELU(),
             nn.Linear(self.proj_dim, 1),
         )
+        self.confidence_head = nn.Sequential(
+            nn.LayerNorm(self.proj_dim),
+            nn.Linear(self.proj_dim, self.proj_dim),
+            nn.GELU(),
+            nn.Linear(self.proj_dim, 1),
+        )
         nn.init.zeros_(self.prior_head[-1].weight)
         nn.init.zeros_(self.prior_head[-1].bias)
+        nn.init.zeros_(self.confidence_head[-1].weight)
+        nn.init.zeros_(self.confidence_head[-1].bias)
 
         self.dropout_layer = nn.Dropout(self.dropout)
         self.backbone = self._build_backbone(config)
@@ -169,4 +177,5 @@ class RuntimeLLMConditioner(nn.Module):
         patch_hidden = patch_hidden.reshape(batch_size, feature_dim, num_patches, self.proj_dim)
         time_hidden = self._restore_time_grid(patch_hidden, time_dim)
         x_prior = self.prior_head(time_hidden).squeeze(-1)
-        return x_prior
+        prior_confidence = torch.sigmoid(self.confidence_head(time_hidden).squeeze(-1))
+        return x_prior, prior_confidence

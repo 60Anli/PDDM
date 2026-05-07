@@ -28,6 +28,7 @@ class CSDI_base(nn.Module):
         self.use_runtime_llm = self.use_llm and self.llm_mode == "runtime"
         self.use_cached_llm = self.use_llm and self.llm_mode == "cache"
         self.prior_loss_weight = float(self.llm_config.get("prior_loss_weight", 0.1))
+        self.use_prior_confidence = bool(self.llm_config.get("use_confidence", True))
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -144,15 +145,21 @@ class CSDI_base(nn.Module):
 
     def get_test_pattern_mask(self, observed_mask, test_pattern_mask):
         return observed_mask * test_pattern_mask
-    def get_x_prior(self, batch, observed_data=None, cond_mask=None):
+    def get_prior_outputs(self, batch, observed_data=None, cond_mask=None):
         if not self.use_llm or not self.use_runtime_llm:
-            return None
+            return None, None
         if observed_data is None or cond_mask is None:
-            return None
+            return None, None
         outputs = self.runtime_llm_conditioner(observed_data, cond_mask)
         if isinstance(outputs, tuple):
-            return outputs[-1]
-        return outputs
+            if len(outputs) >= 2:
+                return outputs[0], outputs[1]
+            return outputs[0], None
+        return outputs, None
+
+    def get_x_prior(self, batch, observed_data=None, cond_mask=None):
+        x_prior, _ = self.get_prior_outputs(batch, observed_data, cond_mask)
+        return x_prior
 
     def get_external_cond_mask(self, batch):
         if "cond_mask" not in batch:
@@ -195,18 +202,18 @@ class CSDI_base(nn.Module):
         return side_info
 
     def calc_loss_valid(
-            self, observed_data, cond_mask, observed_mask, side_info, x_prior, is_train
+            self, observed_data, cond_mask, observed_mask, side_info, x_prior, prior_confidence, is_train
     ):
         loss_sum = 0
         for t in range(self.num_steps):
             loss = self.calc_loss(
-                observed_data, cond_mask, observed_mask, side_info, x_prior, is_train, set_t=t
+                observed_data, cond_mask, observed_mask, side_info, x_prior, prior_confidence, is_train, set_t=t
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
 
     def calc_loss(
-            self, observed_data, cond_mask, observed_mask, side_info, x_prior, is_train, set_t=-1
+            self, observed_data, cond_mask, observed_mask, side_info, x_prior, prior_confidence, is_train, set_t=-1
     ):
         B, K, L = observed_data.shape
         original_target_mask = torch.clamp(observed_mask - cond_mask, min=0, max=1)
@@ -219,7 +226,9 @@ class CSDI_base(nn.Module):
             current_alpha = self.alpha_torch[t]
             gt_noise = torch.randn_like(observed_data)
             noisy_data = (current_alpha ** 0.5) * observed_data + (1.0 - current_alpha) ** 0.5 * gt_noise
-            total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask, x_prior=x_prior)
+            total_input = self.set_input_to_diffmodel(
+                noisy_data, observed_data, cond_mask, x_prior=x_prior, prior_confidence=prior_confidence
+            )
 
             # 调用diffmodel时传入gt_noise和cond_mask，启用层级更新
             predicted, layer_loss, _ = self.diffmodel(
@@ -284,7 +293,9 @@ class CSDI_base(nn.Module):
                 noisy_data = (alpha ** 0.5) * observed_data + (1.0 - alpha) ** 0.5 * gt_noise
 
                 # b. 调用diffmodel，启用层级掩码更新
-                total_input = self.set_input_to_diffmodel(noisy_data, observed_data, current_cond_mask, x_prior=x_prior)
+                total_input = self.set_input_to_diffmodel(
+                    noisy_data, observed_data, current_cond_mask, x_prior=x_prior, prior_confidence=prior_confidence
+                )
                 noise_pred, layer_loss, _ = self.diffmodel(
                     total_input, current_side_info, step,
                     gt_noise=gt_noise, cond_mask=current_cond_mask
@@ -345,7 +356,7 @@ class CSDI_base(nn.Module):
 
             return total_loss
 
-    def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask, x_prior=None):
+    def set_input_to_diffmodel(self, noisy_data, observed_data, cond_mask, x_prior=None, prior_confidence=None):
         if self.is_unconditional == True:
             total_input = noisy_data.unsqueeze(1)  # (B,1,K,L)
         else:
@@ -353,11 +364,14 @@ class CSDI_base(nn.Module):
             noisy_target = ((1 - cond_mask) * noisy_data).unsqueeze(1)
             if x_prior is not None and self.prior_residual_gate is not None:
                 prior_target = ((1 - cond_mask) * x_prior).unsqueeze(1)
+                if prior_confidence is not None and self.use_prior_confidence:
+                    confidence_target = ((1 - cond_mask) * prior_confidence).unsqueeze(1)
+                    prior_target = confidence_target * prior_target
                 noisy_target = noisy_target + torch.tanh(self.prior_residual_gate) * prior_target
             total_input = torch.cat([cond_obs, noisy_target], dim=1)  # (B,2,K,L)
         return total_input
 
-    def impute(self, observed_data, cond_mask, side_info, x_prior, n_samples):
+    def impute(self, observed_data, cond_mask, side_info, x_prior, prior_confidence, n_samples):
         B, K, L = observed_data.shape
         imputed_samples = torch.zeros(B, n_samples, K, L).to(self.device)
 
@@ -377,7 +391,9 @@ class CSDI_base(nn.Module):
                     diff_input = cond_mask * noisy_cond_history[t] + (1.0 - cond_mask) * current_sample
                     diff_input = diff_input.unsqueeze(1)
                 else:
-                    diff_input = self.set_input_to_diffmodel(current_sample, observed_data, cond_mask, x_prior=x_prior)
+                    diff_input = self.set_input_to_diffmodel(
+                        current_sample, observed_data, cond_mask, x_prior=x_prior, prior_confidence=prior_confidence
+                    )
                 # 推理阶段不更新掩码，仅预测
                 predicted, _, _ = self.diffmodel(
                     diff_input, side_info, torch.tensor([t]).to(self.device),
@@ -420,10 +436,10 @@ class CSDI_base(nn.Module):
         else:
             cond_mask = self.get_randmask(observed_mask)
 
-        x_prior = self.get_x_prior(batch, observed_data, cond_mask)
+        x_prior, prior_confidence = self.get_prior_outputs(batch, observed_data, cond_mask)
         side_info = self.get_side_info(observed_tp, cond_mask)
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
-        loss = loss_func(observed_data, cond_mask, observed_mask, side_info, x_prior, is_train)
+        loss = loss_func(observed_data, cond_mask, observed_mask, side_info, x_prior, prior_confidence, is_train)
         return self.add_prior_loss(loss, observed_data, cond_mask, observed_mask, x_prior)
 
     def evaluate(self, batch, n_samples):
@@ -439,9 +455,9 @@ class CSDI_base(nn.Module):
         with torch.no_grad():
             cond_mask = gt_mask
             target_mask = observed_mask - cond_mask
-            x_prior = self.get_x_prior(batch, observed_data, cond_mask)
+            x_prior, prior_confidence = self.get_prior_outputs(batch, observed_data, cond_mask)
             side_info = self.get_side_info(observed_tp, cond_mask)
-            samples = self.impute(observed_data, cond_mask, side_info, x_prior, n_samples)
+            samples = self.impute(observed_data, cond_mask, side_info, x_prior, prior_confidence, n_samples)
 
             for i in range(len(cut_length)):
                 target_mask[i, ..., 0: cut_length[i].item()] = 0
@@ -650,12 +666,14 @@ class CSDI_Forecasting(CSDI_base):
         else:
             cond_mask = self.build_forecasting_cond_mask(observed_mask, gt_mask)
 
-        x_prior = self.get_x_prior(batch, observed_data, cond_mask)
+        x_prior, prior_confidence = self.get_prior_outputs(batch, observed_data, cond_mask)
         if x_prior is not None and feature_id is not None and x_prior.shape[1] != feature_id.shape[1]:
             x_prior = self.sample_cond_mask(x_prior, feature_id)
+        if prior_confidence is not None and feature_id is not None and prior_confidence.shape[1] != feature_id.shape[1]:
+            prior_confidence = self.sample_cond_mask(prior_confidence, feature_id)
         side_info = self.get_side_info(observed_tp, cond_mask, feature_id)
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
-        loss = loss_func(observed_data, cond_mask, observed_mask, side_info, x_prior, is_train)
+        loss = loss_func(observed_data, cond_mask, observed_mask, side_info, x_prior, prior_confidence, is_train)
         return self.add_prior_loss(loss, observed_data, cond_mask, observed_mask, x_prior)
 
     def evaluate(self, batch, n_samples):
@@ -677,8 +695,8 @@ class CSDI_Forecasting(CSDI_base):
             else:
                 cond_mask = self.build_forecasting_cond_mask(observed_mask, gt_mask)
             target_mask = observed_mask * (1 - gt_mask)
-            x_prior = self.get_x_prior(batch, observed_data, cond_mask)
+            x_prior, prior_confidence = self.get_prior_outputs(batch, observed_data, cond_mask)
             side_info = self.get_side_info(observed_tp, cond_mask, feature_id=None)
-            samples = self.impute(observed_data, cond_mask, side_info, x_prior, n_samples)
+            samples = self.impute(observed_data, cond_mask, side_info, x_prior, prior_confidence, n_samples)
 
         return samples, observed_data, target_mask, observed_mask, observed_tp

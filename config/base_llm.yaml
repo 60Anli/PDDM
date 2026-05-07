@@ -30,6 +30,7 @@ model:
     model_name: "./pretrained_models/gpt2"
     embedding_dim: 768
     proj_dim: 64
+    use_confidence: true
     prior_loss_weight: 0.1
     layers: 3
     prefix_tokens: 4
