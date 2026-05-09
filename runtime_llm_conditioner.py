@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class RuntimeLLMConditioner(nn.Module):
-    """Mask-aware online LLM conditioner that only predicts a coarse x_prior."""
+    """Mask-aware online LLM conditioner that predicts a residual prior over x_base."""
 
     def __init__(self, config):
         super().__init__()
@@ -17,7 +17,7 @@ class RuntimeLLMConditioner(nn.Module):
         self.fallback_to_transformer = bool(config.get("fallback_to_transformer", True))
 
         self.patch_projection = nn.Sequential(
-            nn.Linear(self.patch_len * 2 + 6, self.d_llm),
+            nn.Linear(self.patch_len * 3 + 6, self.d_llm),
             nn.GELU(),
             nn.Linear(self.d_llm, self.d_llm),
         )
@@ -149,15 +149,18 @@ class RuntimeLLMConditioner(nn.Module):
         time_hidden = patch_hidden.repeat_interleave(self.patch_len, dim=2)
         return time_hidden[:, :, :target_length, :]
 
-    def forward(self, observed_data, cond_mask):
+    def forward(self, observed_data, cond_mask, x_base=None):
         batch_size, feature_dim, time_dim = observed_data.shape
         known_values = observed_data * cond_mask
+        if x_base is None:
+            x_base = known_values
 
         patch_values = self._patchify(known_values)
         patch_mask = self._patchify(cond_mask)
+        patch_base = self._patchify(x_base)
         patch_stats = self._patch_stats(patch_values, patch_mask)
 
-        patch_inputs = torch.cat([patch_values, patch_mask, patch_stats], dim=-1)
+        patch_inputs = torch.cat([patch_values, patch_mask, patch_base, patch_stats], dim=-1)
         patch_tokens = self.patch_projection(patch_inputs)
         global_tokens = self.global_stat_projection(self._global_stats(observed_data, cond_mask)).unsqueeze(2)
         variable_tokens = self.dropout_layer(patch_tokens + global_tokens)
@@ -176,6 +179,6 @@ class RuntimeLLMConditioner(nn.Module):
         patch_hidden = self.output_projection(patch_hidden)
         patch_hidden = patch_hidden.reshape(batch_size, feature_dim, num_patches, self.proj_dim)
         time_hidden = self._restore_time_grid(patch_hidden, time_dim)
-        x_prior = self.prior_head(time_hidden).squeeze(-1)
+        residual_prior = self.prior_head(time_hidden).squeeze(-1)
         prior_confidence = torch.sigmoid(self.confidence_head(time_hidden).squeeze(-1))
-        return x_prior, prior_confidence
+        return residual_prior, prior_confidence
