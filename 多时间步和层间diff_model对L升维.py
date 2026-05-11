@@ -182,6 +182,20 @@ class diff_CSDI(nn.Module):
 
         self.threshold = config.get("noise_threshold", 1e-5)
         self.current_cond_mask = None
+        self.mechanism_enabled = bool(config.get("mechanism_enabled", False))
+        self.mechanism_hidden_dim = int(config.get("mechanism_hidden_dim", 32))
+        self.mechanism_local_window = int(config.get("mechanism_local_window", 5))
+        self.mechanism_temperature = float(config.get("mechanism_temperature", 0.25))
+        if self.mechanism_enabled:
+            self.layer_mechanism_head = nn.Sequential(
+                nn.Linear(5, self.mechanism_hidden_dim),
+                nn.GELU(),
+                nn.Linear(self.mechanism_hidden_dim, 1),
+            )
+            nn.init.zeros_(self.layer_mechanism_head[-1].weight)
+            nn.init.constant_(self.layer_mechanism_head[-1].bias, -3.0)
+        else:
+            self.layer_mechanism_head = None
 
         self.residual_layers = nn.ModuleList(
             [
@@ -195,6 +209,56 @@ class diff_CSDI(nn.Module):
                 for _ in range(config["layers"])
             ]
         )
+
+    def _distance_features(self, cond_mask):
+        B, K, L = cond_mask.shape
+        time_idx = torch.arange(L, device=cond_mask.device).view(1, 1, L).expand(B, K, L)
+        hard_mask = (cond_mask > 0.5).float()
+
+        prev_index = torch.where(hard_mask > 0, time_idx, torch.zeros_like(time_idx))
+        prev_index, _ = torch.cummax(prev_index, dim=-1)
+        prev_valid = hard_mask.cumsum(dim=-1) > 0
+
+        reversed_mask = torch.flip(hard_mask, dims=[-1])
+        reversed_index = torch.flip(time_idx, dims=[-1])
+        next_index_rev = torch.where(reversed_mask > 0, reversed_index, torch.zeros_like(reversed_index))
+        next_index_rev, _ = torch.cummax(next_index_rev, dim=-1)
+        next_index = torch.flip(next_index_rev, dims=[-1])
+        next_valid = torch.flip(reversed_mask.cumsum(dim=-1) > 0, dims=[-1])
+
+        denom = float(max(L - 1, 1))
+        prev_dist = (time_idx - prev_index).float() / denom
+        next_dist = (next_index - time_idx).float() / denom
+        prev_dist = torch.where(prev_valid, prev_dist, torch.ones_like(prev_dist))
+        next_dist = torch.where(next_valid, next_dist, torch.ones_like(next_dist))
+        return prev_dist, next_dist
+
+    def build_mechanism_features(self, cond_mask, error_map):
+        target_mask = torch.clamp(1.0 - cond_mask, min=0.0, max=1.0)
+        prev_dist, next_dist = self._distance_features(cond_mask)
+        window = max(1, int(self.mechanism_local_window))
+        if window % 2 == 0:
+            window += 1
+        local_missing = F.avg_pool1d(
+            target_mask.reshape(-1, 1, target_mask.shape[-1]),
+            kernel_size=window,
+            stride=1,
+            padding=window // 2,
+        ).reshape_as(target_mask)
+        effective_error = error_map * target_mask
+        error_scale = effective_error.sum(dim=-1, keepdim=True) / target_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        error_norm = effective_error / error_scale.clamp_min(1e-6)
+        features = torch.stack([cond_mask, prev_dist, next_dist, local_missing, error_norm], dim=-1)
+        return features, target_mask
+
+    def get_layer_update_prob(self, cond_mask, error_map):
+        target_mask = torch.clamp(1.0 - cond_mask, min=0.0, max=1.0)
+        if not self.mechanism_enabled or self.layer_mechanism_head is None:
+            return (error_map < self.threshold).float() * target_mask
+        features, target_mask = self.build_mechanism_features(cond_mask, error_map)
+        mechanism_score = torch.sigmoid(self.layer_mechanism_head(features).squeeze(-1))
+        error_gate = torch.sigmoid((1.0 - features[..., -1]) / self.mechanism_temperature)
+        return mechanism_score * error_gate * target_mask
 
     def forward(self, x, cond_info, diffusion_step, gt_noise=None, cond_mask=None):
         B, inputdim, K, L = x.shape
@@ -224,7 +288,7 @@ class diff_CSDI(nn.Module):
                 total_loss += layer_loss
 
                 noise_error = torch.abs(noise_pred - gt_noise) * target_mask
-                new_known_mask = (noise_error < self.threshold).float()
+                new_known_mask = self.get_layer_update_prob(self.current_cond_mask, noise_error)
                 self.current_cond_mask = torch.clamp(self.current_cond_mask + new_known_mask, 0, 1)
 
                 if current_side_info.shape[1] > 0 and self.current_cond_mask is not None:
