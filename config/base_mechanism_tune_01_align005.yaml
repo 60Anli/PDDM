@@ -1,0 +1,47 @@
+train:
+  epochs: 200
+  batch_size: 16
+  lr: 0.001
+  itr_per_epoch: 100000000.0
+  mixup: false
+diffusion:
+  layers: 4
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.5
+  num_steps: 50
+  schedule: quad
+  is_linear: false
+model:
+  is_unconditional: 0
+  timeemb: 128
+  featureemb: 16
+  target_strategy: random
+  llm:
+    enabled: false
+    mode: runtime
+    cache_dir: ./data/llm_embeddings
+    model_name: gpt2
+    embedding_dim: 768
+    proj_dim: 32
+    target_only: true
+    layers: 3
+    prefix_tokens: 4
+    dropout: 0.1
+    use_backbone: true
+    local_files_only: false
+    fallback_to_transformer: true
+    num_mask_variants: 4
+    missing_ratio_min: 0.05
+    missing_ratio_max: 0.5
+    require_cache: true
+    max_prompt_values: 48
+  mechanism:
+    enabled: true
+    hidden_dim: 32
+    local_window: 5
+    temperature: 0.25
+    alignment_weight: 0.05
+    sparsity_weight: 0.01
