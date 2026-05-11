@@ -34,6 +34,8 @@ class CSDI_base(nn.Module):
         self.mechanism_hidden_dim = int(self.mechanism_config.get("hidden_dim", 32))
         self.mechanism_local_window = int(self.mechanism_config.get("local_window", 5))
         self.mechanism_temperature = float(self.mechanism_config.get("temperature", 0.25))
+        self.mechanism_alignment_weight = float(self.mechanism_config.get("alignment_weight", 0.1))
+        self.mechanism_sparsity_weight = float(self.mechanism_config.get("sparsity_weight", 0.01))
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -209,12 +211,21 @@ class CSDI_base(nn.Module):
 
     def get_step_update_prob(self, cond_mask, error_map):
         target_mask = torch.clamp(1.0 - cond_mask, min=0.0, max=1.0)
+        zero = torch.tensor(0.0, device=cond_mask.device)
         if not self.use_mechanism or self.step_mechanism_head is None:
-            return (error_map < self.step_threshold).float() * target_mask
+            return (error_map < self.step_threshold).float() * target_mask, zero
         features, target_mask = self.build_mechanism_features(cond_mask, error_map)
         mechanism_score = torch.sigmoid(self.step_mechanism_head(features).squeeze(-1))
         error_gate = torch.sigmoid((1.0 - features[..., -1]) / self.mechanism_temperature)
-        return mechanism_score * error_gate * target_mask
+        update_prob = mechanism_score * error_gate * target_mask
+
+        teacher = (error_map < self.step_threshold).float() * target_mask
+        denom = target_mask.sum().clamp_min(1.0)
+        align_loss = F.binary_cross_entropy(mechanism_score, teacher, reduction="none")
+        align_loss = (align_loss * target_mask).sum() / denom
+        sparsity_loss = update_prob.sum() / denom
+        aux_loss = self.mechanism_alignment_weight * align_loss + self.mechanism_sparsity_weight * sparsity_loss
+        return update_prob, aux_loss
 
     def get_x_prior(self, batch, observed_data=None, cond_mask=None):
         if not self.use_llm or not self.use_runtime_llm:

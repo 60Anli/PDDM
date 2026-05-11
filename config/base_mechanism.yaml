@@ -50,3 +50,5 @@ model:
     hidden_dim: 32
     local_window: 5
     temperature: 0.25
+    alignment_weight: 0.1
+    sparsity_weight: 0.01

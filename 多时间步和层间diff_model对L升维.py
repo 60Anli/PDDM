@@ -186,6 +186,8 @@ class diff_CSDI(nn.Module):
         self.mechanism_hidden_dim = int(config.get("mechanism_hidden_dim", 32))
         self.mechanism_local_window = int(config.get("mechanism_local_window", 5))
         self.mechanism_temperature = float(config.get("mechanism_temperature", 0.25))
+        self.mechanism_alignment_weight = float(config.get("mechanism_alignment_weight", 0.1))
+        self.mechanism_sparsity_weight = float(config.get("mechanism_sparsity_weight", 0.01))
         if self.mechanism_enabled:
             self.layer_mechanism_head = nn.Sequential(
                 nn.Linear(5, self.mechanism_hidden_dim),
@@ -253,12 +255,21 @@ class diff_CSDI(nn.Module):
 
     def get_layer_update_prob(self, cond_mask, error_map):
         target_mask = torch.clamp(1.0 - cond_mask, min=0.0, max=1.0)
+        zero = torch.tensor(0.0, device=cond_mask.device)
         if not self.mechanism_enabled or self.layer_mechanism_head is None:
-            return (error_map < self.threshold).float() * target_mask
+            return (error_map < self.threshold).float() * target_mask, zero
         features, target_mask = self.build_mechanism_features(cond_mask, error_map)
         mechanism_score = torch.sigmoid(self.layer_mechanism_head(features).squeeze(-1))
         error_gate = torch.sigmoid((1.0 - features[..., -1]) / self.mechanism_temperature)
-        return mechanism_score * error_gate * target_mask
+        update_prob = mechanism_score * error_gate * target_mask
+
+        teacher = (error_map < self.threshold).float() * target_mask
+        denom = target_mask.sum().clamp_min(1.0)
+        align_loss = F.binary_cross_entropy(mechanism_score, teacher, reduction="none")
+        align_loss = (align_loss * target_mask).sum() / denom
+        sparsity_loss = update_prob.sum() / denom
+        aux_loss = self.mechanism_alignment_weight * align_loss + self.mechanism_sparsity_weight * sparsity_loss
+        return update_prob, aux_loss
 
     def forward(self, x, cond_info, diffusion_step, gt_noise=None, cond_mask=None):
         B, inputdim, K, L = x.shape
@@ -288,7 +299,8 @@ class diff_CSDI(nn.Module):
                 total_loss += layer_loss
 
                 noise_error = torch.abs(noise_pred - gt_noise) * target_mask
-                new_known_mask = self.get_layer_update_prob(self.current_cond_mask, noise_error)
+                new_known_mask, mechanism_aux_loss = self.get_layer_update_prob(self.current_cond_mask, noise_error)
+                total_loss += mechanism_aux_loss
                 self.current_cond_mask = torch.clamp(self.current_cond_mask + new_known_mask, 0, 1)
 
                 if current_side_info.shape[1] > 0 and self.current_cond_mask is not None:
