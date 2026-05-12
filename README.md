@@ -1,90 +1,47 @@
-# PDDM Coarse Prior with GPT-2
+﻿# PDDM 实验仓库说明
 
-This repository contains a PDDM-based time-series imputation branch that adds a GPT-2 coarse prior (`x_prior`) while keeping the diffusion model responsible for final refinement.
+这个仓库是在原始 PDDM 插补框架上不断做实验得到的版本集合，重点保留了不同思路的配置和入口，方便直接对比。
 
-## Current Idea
+## 基线
 
-Instead of injecting a full LLM feature branch into the diffusion backbone, this version only uses GPT-2 to produce a coarse imputation prior:
+原始基线仍然是 PDDM 本身，核心脚本包括：
+- `exe_physio.py`
+- `exe_pm25.py`
+- `exe_weather.py`
+- `exe_ettm1.py`
+- `多时间步和层间main_model.py`
+- `多时间步和层间diff_model对L升维.py`
 
-- observed values and `cond_mask` are encoded by a runtime GPT-2 conditioner
-- the conditioner predicts a coarse prior `x_prior`
-- `x_prior` is injected only on target positions through a zero-initialized residual gate
-- the diffusion model still performs the final denoising and imputation
-- training includes an auxiliary `prior_loss`
+## 当前保留的实验方向
 
-This design is intended to reduce the risk that LLM features directly disturb the original PDDM denoising path.
+详细模式说明见：
+- [EXPERIMENT_MODES.md](./EXPERIMENT_MODES.md)
 
-## Main Code Files
+当前主要包括：
+- `base_llm.yaml`：GPT-2 粗插补先验路线
+- `base_mechanism.yaml`：缺失机制软更新路线
+- `base_mechanism_hard.yaml`：缺失机制硬阈值修复版
+- `base_periodic.yaml`：均值填充 + 周期先验 + 频域损失
+- `base_periodic_nofreq.yaml`：均值填充 + 周期先验，不加频域损失
+- `base_periodic_linear.yaml`：线性插值 + 周期先验 + 频域损失
 
-- `runtime_llm_conditioner.py`: GPT-2-based coarse prior generator
-- `多时间步和层间main_model.py`: imputation model with `x_prior` and `prior_loss`
-- `多时间步和层间diff_model对L升维.py`: diffusion backbone without the old `llm_info` branch
-- `config/base_llm.yaml`: main experiment configuration
+## 最近改动说明
 
-## Datasets Supported
+简要改动总结见：
+- [CHANGE_NOTES_20260512.md](./CHANGE_NOTES_20260512.md)
 
-Imputation:
-- Physio
-- PM2.5
-- Weather
-- ETTm1
+## 环境建议
 
-Forecasting scripts are also kept in the repository, but the main focus of this branch is the coarse-prior imputation setting.
-
-## Environment
-
-Recommended environment:
-- Python in conda env `torch230cuda121`
+推荐环境：
+- conda 环境：`torch230cuda121`
 - PyTorch
-- transformers
-- safetensors
 - pandas
 - pyyaml
 - tqdm
+- transformers（只有 LLM 路线需要）
 
-GPT-2 is loaded locally from:
-- `./pretrained_models/gpt2`
+## 额外说明
 
-## Run Commands
-
-### Physio
-```powershell
-python exe_physio.py --config base_llm.yaml --device cuda:0 --seed 1 --nfold 0 --testmissingratio 0.1 --nsample 100
-```
-
-### PM2.5
-```powershell
-python exe_pm25.py --config base_llm.yaml --device cuda:0 --validationindex 0 --targetstrategy random --nsample 100
-```
-
-### Weather Random Missing
-```powershell
-python exe_weather.py --config base_llm.yaml --device cuda:0 --data_path ./data/Weather --eval_length 24 --missing_ratio 0.2 --missing_pattern random --target_strategy random --nsample 50
-```
-
-### Weather Block Missing
-```powershell
-python exe_weather.py --config base_llm.yaml --device cuda:0 --data_path ./data/Weather --eval_length 24 --missing_ratio 0.0015 --missing_pattern block --target_strategy block --nsample 50
-```
-
-### ETTm1 Random Missing
-```powershell
-python exe_ettm1.py --config base_llm.yaml --device cuda:0 --data_path ./data/ETT_processed/ETTm1 --raw_data_path ./data/ETT_raw/ETTm1.csv --eval_length 24 --missing_ratio 0.2 --missing_pattern random --target_strategy random --nsample 50
-```
-
-### ETTm1 Block Missing
-```powershell
-python exe_ettm1.py --config base_llm.yaml --device cuda:0 --data_path ./data/ETT_processed/ETTm1 --raw_data_path ./data/ETT_raw/ETTm1.csv --eval_length 24 --missing_ratio 0.0015 --missing_pattern block --target_strategy block --nsample 50
-```
-
-## Notes on Versioning
-
-This repository intentionally does not track:
-- dataset files
-- experiment outputs under `save/`
-- local pretrained model weights under `pretrained_models/`
-- caches and IDE files
-
-A good commit for this stage should describe the method change clearly, for example:
-- `feat: add GPT-2 coarse prior imputation branch`
-- `exp: switch from llm_info injection to x_prior-only`
+- LLM 路线需要 `./pretrained_models/gpt2`
+- mechanism 和 periodic 路线不依赖 GPT-2
+- 仓库里还保留了 forecasting 相关脚本，但最近主要做的是插补实验

@@ -29,16 +29,13 @@ class CSDI_base(nn.Module):
         self.use_runtime_llm = self.use_llm and self.llm_mode == "runtime"
         self.use_cached_llm = self.use_llm and self.llm_mode == "cache"
         self.prior_loss_weight = float(self.llm_config.get("prior_loss_weight", 0.1))
-        self.mechanism_config = config.get("model", {}).get("mechanism", {})
-        self.use_mechanism = bool(self.mechanism_config.get("enabled", False))
-        self.mechanism_hidden_dim = int(self.mechanism_config.get("hidden_dim", 32))
-        self.mechanism_local_window = int(self.mechanism_config.get("local_window", 5))
-        self.mechanism_temperature = float(self.mechanism_config.get("temperature", 0.25))
-        self.mechanism_alignment_weight = float(self.mechanism_config.get("alignment_weight", 0.1))
-        self.mechanism_sparsity_weight = float(self.mechanism_config.get("sparsity_weight", 0.01))
-        self.mechanism_step_enabled = bool(self.mechanism_config.get("step_enabled", self.use_mechanism))
-        self.mechanism_layer_enabled = bool(self.mechanism_config.get("layer_enabled", False))
-        self.mechanism_hard_threshold = float(self.mechanism_config.get("hard_threshold", 0.5))
+        self.periodic_config = config.get("model", {}).get("periodic", {})
+        self.use_periodic = bool(self.periodic_config.get("enabled", False))
+        self.periodic_topk = int(self.periodic_config.get("topk", 4))
+        self.periodic_fill_mode = str(self.periodic_config.get("fill_mode", "mean")).lower()
+        self.periodic_exclude_dc = bool(self.periodic_config.get("exclude_dc", True))
+        self.periodic_time_loss_weight = float(self.periodic_config.get("time_loss_weight", 0.1))
+        self.periodic_freq_loss_weight = float(self.periodic_config.get("freq_loss_weight", 0.05))
 
         self.emb_total_dim = self.emb_time_dim + self.emb_feature_dim
         if self.is_unconditional == False:
@@ -49,29 +46,17 @@ class CSDI_base(nn.Module):
         )
         if self.use_runtime_llm:
             self.runtime_llm_conditioner = RuntimeLLMConditioner(self.llm_config)
-            self.prior_residual_gate = nn.Parameter(torch.zeros(1))
         else:
             self.runtime_llm_conditioner = None
-            self.prior_residual_gate = None
 
-        if self.use_mechanism and self.mechanism_step_enabled:
-            self.step_mechanism_head = nn.Sequential(
-                nn.Linear(5, self.mechanism_hidden_dim),
-                nn.GELU(),
-                nn.Linear(self.mechanism_hidden_dim, 1),
-            )
-            nn.init.zeros_(self.step_mechanism_head[-1].weight)
-            nn.init.constant_(self.step_mechanism_head[-1].bias, -3.0)
+        if self.use_runtime_llm or self.use_periodic:
+            self.prior_residual_gate = nn.Parameter(torch.zeros(1))
         else:
-            self.step_mechanism_head = None
+            self.prior_residual_gate = None
 
         config_diff = config["diffusion"]
         config_diff["side_dim"] = self.emb_total_dim
-        config_diff["noise_threshold"] = self.layer_threshold
-        config_diff["mechanism_enabled"] = self.use_mechanism
-        config_diff["mechanism_hidden_dim"] = self.mechanism_hidden_dim
-        config_diff["mechanism_local_window"] = self.mechanism_local_window
-        config_diff["mechanism_temperature"] = self.mechanism_temperature  # 传递层级阈值到diffmodel
+        config_diff["noise_threshold"] = self.layer_threshold  # 传递层级阈值到diffmodel
 
         input_dim = 1 if self.is_unconditional == True else 2
         self.diffmodel = diff_CSDI(config_diff, input_dim)
@@ -171,75 +156,75 @@ class CSDI_base(nn.Module):
     def get_test_pattern_mask(self, observed_mask, test_pattern_mask):
         return observed_mask * test_pattern_mask
 
-    def _distance_features(self, cond_mask):
-        B, K, L = cond_mask.shape
-        time_idx = torch.arange(L, device=cond_mask.device).view(1, 1, L).expand(B, K, L)
-        hard_mask = (cond_mask > 0.5).float()
+    def linear_interpolate_fill(self, observed_data, cond_mask):
+        import numpy as np
 
-        prev_index = torch.where(hard_mask > 0, time_idx, torch.zeros_like(time_idx))
-        prev_index, _ = torch.cummax(prev_index, dim=-1)
-        prev_valid = hard_mask.cumsum(dim=-1) > 0
+        obs_np = observed_data.detach().cpu().numpy()
+        mask_np = cond_mask.detach().cpu().numpy()
+        B, K, L = obs_np.shape
+        x = np.arange(L, dtype=np.float32)
+        filled = obs_np.copy()
 
-        reversed_mask = torch.flip(hard_mask, dims=[-1])
-        reversed_index = torch.flip(time_idx, dims=[-1])
-        next_index_rev = torch.where(reversed_mask > 0, reversed_index, torch.zeros_like(reversed_index))
-        next_index_rev, _ = torch.cummax(next_index_rev, dim=-1)
-        next_index = torch.flip(next_index_rev, dims=[-1])
-        next_valid = torch.flip(reversed_mask.cumsum(dim=-1) > 0, dims=[-1])
+        for b in range(B):
+            for k in range(K):
+                known_idx = np.where(mask_np[b, k] > 0.5)[0]
+                if known_idx.size == 0:
+                    filled[b, k] = 0.0
+                    continue
+                known_val = obs_np[b, k, known_idx]
+                if known_idx.size == 1:
+                    filled[b, k] = known_val[0]
+                else:
+                    filled[b, k] = np.interp(x, known_idx.astype(np.float32), known_val.astype(np.float32))
 
-        denom = float(max(L - 1, 1))
-        prev_dist = (time_idx - prev_index).float() / denom
-        next_dist = (next_index - time_idx).float() / denom
-        prev_dist = torch.where(prev_valid, prev_dist, torch.ones_like(prev_dist))
-        next_dist = torch.where(next_valid, next_dist, torch.ones_like(next_dist))
-        return prev_dist, next_dist
+        filled = torch.from_numpy(filled).to(observed_data.device, dtype=observed_data.dtype)
+        return cond_mask * observed_data + (1.0 - cond_mask) * filled
 
-    def build_mechanism_features(self, cond_mask, error_map):
-        target_mask = torch.clamp(1.0 - cond_mask, min=0.0, max=1.0)
-        prev_dist, next_dist = self._distance_features(cond_mask)
-        window = max(1, int(self.mechanism_local_window))
-        if window % 2 == 0:
-            window += 1
-        local_missing = F.avg_pool1d(
-            target_mask.reshape(-1, 1, target_mask.shape[-1]),
-            kernel_size=window,
-            stride=1,
-            padding=window // 2,
-        ).reshape_as(target_mask)
-        effective_error = error_map * target_mask
-        error_scale = effective_error.sum(dim=-1, keepdim=True) / target_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        error_norm = effective_error / error_scale.clamp_min(1e-6)
-        features = torch.stack([cond_mask, prev_dist, next_dist, local_missing, error_norm], dim=-1)
-        return features, target_mask
-
-    def get_step_update_mask(self, cond_mask, error_map):
-        target_mask = torch.clamp(1.0 - cond_mask, min=0.0, max=1.0)
-        zero = torch.tensor(0.0, device=cond_mask.device)
-        if not self.use_mechanism or not self.mechanism_step_enabled or self.step_mechanism_head is None:
-            return (error_map < self.step_threshold).float() * target_mask, zero
-        features, target_mask = self.build_mechanism_features(cond_mask, error_map)
-        mechanism_score = torch.sigmoid(self.step_mechanism_head(features).squeeze(-1))
-        error_gate = torch.sigmoid((1.0 - features[..., -1]) / self.mechanism_temperature)
-        update_prob = mechanism_score * error_gate * target_mask
-        update_mask = (update_prob > self.mechanism_hard_threshold).float() * target_mask
-
-        teacher = (error_map < self.step_threshold).float() * target_mask
-        denom = target_mask.sum().clamp_min(1.0)
-        align_loss = F.binary_cross_entropy(mechanism_score, teacher, reduction="none")
-        align_loss = (align_loss * target_mask).sum() / denom
-        sparsity_loss = update_prob.sum() / denom
-        aux_loss = self.mechanism_alignment_weight * align_loss + self.mechanism_sparsity_weight * sparsity_loss
-        return update_mask.detach(), aux_loss
-
-    def get_x_prior(self, batch, observed_data=None, cond_mask=None):
-        if not self.use_llm or not self.use_runtime_llm:
-            return None
+    def build_periodic_prior(self, observed_data, cond_mask):
         if observed_data is None or cond_mask is None:
             return None
-        outputs = self.runtime_llm_conditioner(observed_data, cond_mask)
-        if isinstance(outputs, tuple):
-            return outputs[-1]
-        return outputs
+        B, K, L = observed_data.shape
+        if L <= 1:
+            return cond_mask * observed_data
+
+        if self.periodic_fill_mode == "linear":
+            filled = self.linear_interpolate_fill(observed_data, cond_mask)
+        else:
+            known = observed_data * cond_mask
+            count = cond_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            mean_fill = known.sum(dim=-1, keepdim=True) / count
+            filled = cond_mask * observed_data + (1.0 - cond_mask) * mean_fill
+
+        spectrum = torch.fft.rfft(filled, dim=-1)
+        n_freq = spectrum.shape[-1]
+        start = 1 if self.periodic_exclude_dc and n_freq > 1 else 0
+        available = max(0, n_freq - start)
+        if available == 0:
+            periodic = filled
+        else:
+            topk = max(1, min(self.periodic_topk, available))
+            amplitude = torch.sqrt(spectrum.real.square() + spectrum.imag.square())
+            keep = torch.zeros_like(amplitude, dtype=torch.bool)
+            if start == 1:
+                keep[..., 0] = True
+            scores = amplitude[..., start:]
+            topk_idx = torch.topk(scores, k=topk, dim=-1).indices + start
+            keep.scatter_(-1, topk_idx, True)
+            filtered = spectrum * keep
+            periodic = torch.fft.irfft(filtered, n=L, dim=-1)
+
+        return cond_mask * observed_data + (1.0 - cond_mask) * periodic
+    def get_x_prior(self, batch, observed_data=None, cond_mask=None):
+        if observed_data is None or cond_mask is None:
+            return None
+        if self.use_llm and self.use_runtime_llm:
+            outputs = self.runtime_llm_conditioner(observed_data, cond_mask)
+            if isinstance(outputs, tuple):
+                return outputs[-1]
+            return outputs
+        if self.use_periodic:
+            return self.build_periodic_prior(observed_data, cond_mask)
+        return None
 
     def get_external_cond_mask(self, batch):
         if "cond_mask" not in batch:
@@ -247,7 +232,8 @@ class CSDI_base(nn.Module):
         return batch["cond_mask"].to(self.device).float().permute(0, 2, 1)
 
     def compute_prior_loss(self, observed_data, cond_mask, observed_mask, x_prior):
-        if x_prior is None or self.prior_loss_weight <= 0:
+        prior_weight = self.prior_loss_weight if self.use_llm else self.periodic_time_loss_weight
+        if x_prior is None or prior_weight <= 0:
             return torch.tensor(0.0, device=self.device)
         target_mask = torch.clamp(observed_mask - cond_mask, min=0, max=1)
         num_eval = target_mask.sum()
@@ -256,11 +242,27 @@ class CSDI_base(nn.Module):
         residual = (x_prior - observed_data) * target_mask
         return (residual ** 2).sum() / num_eval
 
+    def compute_frequency_loss(self, observed_data, x_prior):
+        if x_prior is None or not self.use_periodic or self.periodic_freq_loss_weight <= 0:
+            return torch.tensor(0.0, device=self.device)
+        gt_spec = torch.fft.rfft(observed_data, dim=-1)
+        pred_spec = torch.fft.rfft(x_prior, dim=-1)
+        gt_fft = torch.sqrt(gt_spec.real.square() + gt_spec.imag.square())
+        pred_fft = torch.sqrt(pred_spec.real.square() + pred_spec.imag.square())
+        gt_fft = gt_fft / gt_fft.mean(dim=-1, keepdim=True).clamp_min(1e-6)
+        pred_fft = pred_fft / pred_fft.mean(dim=-1, keepdim=True).clamp_min(1e-6)
+        return F.mse_loss(pred_fft, gt_fft)
+
     def add_prior_loss(self, loss, observed_data, cond_mask, observed_mask, x_prior):
-        if x_prior is None or self.prior_loss_weight <= 0:
+        if x_prior is None:
             return loss
         prior_loss = self.compute_prior_loss(observed_data, cond_mask, observed_mask, x_prior)
-        return loss + self.prior_loss_weight * prior_loss
+        prior_weight = self.prior_loss_weight if self.use_llm else self.periodic_time_loss_weight
+        total_loss = loss + prior_weight * prior_loss
+        if self.use_periodic and self.periodic_freq_loss_weight > 0:
+            freq_loss = self.compute_frequency_loss(observed_data, x_prior)
+            total_loss = total_loss + self.periodic_freq_loss_weight * freq_loss
+        return total_loss
 
     def get_side_info(self, observed_tp, cond_mask):
         B, K, L = cond_mask.shape
@@ -392,8 +394,8 @@ class CSDI_base(nn.Module):
                 is_main_step = (step == t).all()
                 if not is_main_step:
                     mae = torch.abs(gt_noise - noise_pred)
-                    to_update, mechanism_aux_loss = self.get_step_update_mask(current_cond_mask, mae)
-                    total_step_loss = total_step_loss + mechanism_aux_loss
+                    to_update = (mae < self.step_threshold).float() * dynamic_target_mask
+                    to_update = to_update.detach()
                     added_step = to_update.sum().item()
                     total_added_step.append(added_step)
 
